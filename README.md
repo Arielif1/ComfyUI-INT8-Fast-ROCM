@@ -1,3 +1,62 @@
+# ComfyUI-INT8-Fast-ROCM — rocblas DP4a backend fork
+
+(Vibecoded) Fork of [patientx/ComfyUI-INT8-Fast-ROCM](https://github.com/patientx/ComfyUI-INT8-Fast-ROCM)
+that swaps the pack's Triton INT8 GEMMs for a **rocBLAS-backed native INT8
+(DP4a) backend on AMD RDNA2**. Everything else — model loading, ComfyKitchen
+integration, ConvRot rotation, LoRA baking, per-row/per-channel quant — is
+unchanged and comes from the original pack. Very WIP, expect jank. All courtesy of Deepseek-V4-Flash-0731.
+
+(Set `ROCM_INT8_ROCBLAS=0` to revert to the original Triton
+kernels at runtime.)
+
+## Why
+
+On RDNA2 (RX 6600 / gfx1032) the pack's Triton `tl.dot` INT8 kernels compile to
+FMA emulation — no native INT8 path. rocBLAS ships real DP4a kernels for
+gfx1032, giving a genuine ~2× instruction rate on INT8 GEMMs.
+
+**Important:** the loader's `weight_dtype` must be set to **`fp16`** (not
+default/bf16) — bf16 runs at FP32 rate on RDNA2 and it is what the original
+pack's default uses.
+
+## Results (Anima, 1024×1024, 10 steps, CFG 5 — KSampler s/it)
+
+| Variant | s/it |
+|---|---|
+| fp8 (bf16 compute) | 13.4 |
+| INT8 Triton (pack), bf16 compute | 7.52 |
+| INT8 Triton (pack), fp16 compute | 5.73 |
+| **INT8 rocblas (this fork), fp16 compute** | **5.51** |
+
+That is **~2.4× faster than fp8** and **~1.04× faster than the pack's Triton
+kernels at the same fp16 compute settings** (the gap widens to ~1.36× when both
+use the bf16 default, which forces the Triton path's fp32-upcast quantize).
+
+## Which models does it work on?
+
+The backend is model-agnostic: it replaces the GEMM behind whatever the pack
+already handles (W8A8/ConvRot DiTs — Flux2, Anima, Chroma, Z-Image, etc.), and
+supports both per-channel and per-row weight scales, fp16 and bf16 compute
+outputs. **It has only been tested on Anima so far** —
+expect it to work on the others but verify before relying on it.
+
+## Caveats / notes
+
+- The original pack's Triton kernels beat rocBLAS on some small/odd GEMM shapes;
+  the workflow-level win comes from the steady state at real model shapes.
+- The compiled extension lives as C++/HIP source inside `rocblas_int8.py`:
+  on first import it builds via torch's `load_inline` when no prebuilt `.pyd`
+  is found (needs MSVC once, plus the ROCm SDK include/lib paths — the `DEVEL`
+  constant at the top is hardcoded to the dev machine, adjust it if building
+  elsewhere), and is then loaded directly at runtime — no toolchain needed
+  after the first build.
+- Only tested on Windows + ROCm 7.14 (ComfyUI 0.33), RX 6600.
+
+---
+
+<details>
+<summary><b>Original README (patientx/ComfyUI-INT8-Fast-ROCM)</b></summary>
+
 # 🎉 INT8 is now officially supported in ComfyUI 🎉
 https://github.com/Comfy-Org/ComfyUI/commit/1a510f04234e5a213d3985a1a54f65652623f4bc
 
@@ -116,3 +175,4 @@ https://github.com/silveroxides/convert_to_quant
 https://github.com/silveroxides/ComfyUI-QuantOps
 
 ## The unholy trinity of AI slopsters I used to glue all this together over the course of multiple months now
+</details>

@@ -369,3 +369,41 @@ def triton_int8_linear_per_row(x: torch.Tensor, weight: torch.Tensor, weight_sca
 
     # 6. Reshape output
     return output.reshape(x_shape_orig[:-1] + (N,))
+
+
+# =============================================================================
+# ROCm RDNA2 (gfx103x) OVERRIDE -- rocblas DP4a backend
+# =============================================================================
+# The triton kernels above use tl.dot, which on RDNA2 (gfx103x) is
+# config-sensitive (fair benchmark: x0.78-1.53 vs fp16, see
+# bench_pack_vs_rocblas2.py). The rocblas-backed replacements
+# (hipblasGemmEx -> rocblas I8I_HPA/4xi8I_HPA DP4a kernels) are bit-exact in
+# the int32 GEMM, skip the pack's fp32 upcast, and measure 1.24-1.39x FASTER
+# than fp16 at real MLP shapes -- and ~1.36x faster than the pack's per-row
+# kernel, which is the path convrot models use.
+#
+# Both consumers (`int8_quant.py` and `rocm_int8_kitchen_patch.py`) do
+# `from .int8_fused_kernel import triton_int8_linear[_per_row]` at import
+# time, so redefining the names here (after this module fully executes)
+# routes every dispatch path through rocblas.
+#
+# Toggle: set ROCM_INT8_ROCBLAS=0 to keep the pack's original triton kernels
+# (used for the A/B benchmark: same workflow, triton vs rocblas). Default on.
+import os as _os
+if _os.environ.get("ROCM_INT8_ROCBLAS", "1").strip().lower() not in ("0", "false", "off", "no"):
+    try:
+        try:
+            from .rocblas_int8 import int8_linear as _rocblas_int8_linear
+            from .rocblas_int8 import int8_linear_per_row as _rocblas_int8_linear_per_row
+        except ImportError:
+            # loaded as a top-level module (standalone testing), not a package
+            from rocblas_int8 import int8_linear as _rocblas_int8_linear
+            from rocblas_int8 import int8_linear_per_row as _rocblas_int8_linear_per_row
+
+        triton_int8_linear = _rocblas_int8_linear
+        triton_int8_linear_per_row = _rocblas_int8_linear_per_row
+        print("[ComfyUI-INT8-Fast-ROCM] rocblas DP4a backend ACTIVE (replaced triton GEMMs)")
+    except Exception as _e:
+        print(f"[ComfyUI-INT8-Fast-ROCM] rocblas override unavailable: {_e!r} -- using triton kernels")
+else:
+    print("[ComfyUI-INT8-Fast-ROCM] ROCM_INT8_ROCBLAS=0 -- using pack's original triton kernels")
