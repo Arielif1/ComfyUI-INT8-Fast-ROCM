@@ -52,6 +52,26 @@ expect it to work on the others but verify before relying on it.
   after the first build.
 - Only tested on Windows + ROCm 7.14 (ComfyUI 0.33), RX 6600.
 
+## Fused DP4a kernel (B1, optional)
+
+An optional hand-written DP4a GEMM with the dequant epilogue fused in-kernel,
+achieving ~45% of DP4a peak (vs rocBLAS ~35–38%) while remaining
+**byte-identical** to the 3-launch path (same seed, same PNG).
+
+Enable: `ROCM_INT8_B1=1` before launching. Default OFF — no change to shipped
+behaviour without this flag.
+
+| | 3-launch | B1 fused |
+|---|---|---|
+| s/it (Anima 1024², fp16) | 5.51 | **5.31** |
+| PNG | `5573d639…` | `5573d639…` (byte-identical) |
+| launches per linear | 3 | 2 (quantize + fused GEMM+dequant) |
+
+DP4a true peak on RX 6600 = 17.85 T-MAC/s (1792 × 4 MAC/cyc × 2.49 GHz);
+int8 is exactly 2× fp16 on this hardware (32-bit datapath: 4×8b vs 2×16b).
+Attention (SDPA math) is a bandwidth wall (~1.9 s/step, no flash on gfx1032)
+and is the remaining ~36% of step time that cannot be kernel-optimized away.
+
 ---
 
 <details>

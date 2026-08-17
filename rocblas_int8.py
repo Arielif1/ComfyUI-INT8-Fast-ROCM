@@ -39,6 +39,211 @@ _CUDA_SRC = r"""
 #include <hip/hip_fp16.h>
 #include <math.h>
 
+// =================== B1: hand-written DP4a GEMM + fused dequant ==================
+// 2026-08-17. Replaces the rocBLAS int8 GEMM + separate dequant launch when
+// ROCM_INT8_B1=1 (2 launches per linear instead of 3). Bit-identical to the
+// 3-launch path: int32 accumulation is exact integer math and the epilogue
+// matches dequant_kernel's op order exactly:
+//   v = (float)acc * (x_scale[m] * w_scale[n]); if bias: v += half2float(bias[n])
+// Config (swept on-card, docs/b1-kernel-report.md): 128x128x32 tile, 8x8
+// micro-tile, 256 threads, LDS pads +4, XOR-swizzled smem (mask 7) keys the
+// k-chunk index by the lane-varying tile row so B-frag loads are conflict-free.
+// Software pipeline: stage k+1 global data prefetched into registers during
+// compute of stage k, stored to the alternate smem buffer after the barrier.
+// DP4a issue via inline asm (LLVM GFX10 backend cannot emit v_dot4 on its own).
+#define B1_BM 128
+#define B1_BN 128
+#define B1_BK 32
+#define B1_MM 8
+#define B1_MN 8
+#define B1_THREADS 256
+#define B1_TM (B1_BM / B1_MM)   // 16
+#define B1_TN (B1_BN / B1_MN)   // 16
+#define B1_SA (B1_BK + 4)
+#define B1_SB (B1_BN + 4)
+#define B1_KCH (B1_BK / 4)
+#define B1_ACH (B1_BM * B1_KCH)
+#define B1_BCH (B1_BN * B1_KCH)
+#define B1_AITER (B1_BM * B1_KCH / B1_THREADS)   // 4
+#define B1_BITER (B1_BN * B1_KCH / B1_THREADS)   // 4
+
+__device__ __forceinline__ int b1_dot4(int a, int b, int acc) {
+    int r;
+    asm volatile("v_dot4_i32_i8 %0, %1, %2, %3" : "=v"(r) : "v"(a), "v"(b), "v"(acc));
+    return r;
+}
+
+__device__ __forceinline__ void b1_stage_load(
+    const int8_t* __restrict__ A, const int8_t* __restrict__ W,
+    int* regA, int* regB, int tid, int m0, int n0, int M, int N, int K, int k0)
+{
+    #pragma unroll
+    for (int i = 0; i < B1_AITER; ++i) {
+        const int p = tid + i * B1_THREADS;
+        if (p < B1_ACH) {
+            const int m = p / B1_KCH, k4 = p % B1_KCH;
+            const int gk = k0 + k4 * 4;
+            const int row = m0 + m;
+            const int aoff = row * K + gk;
+            int v = 0;
+            if (row < M && gk + 3 < K) v = *(const int*)(A + aoff);
+            else {
+                #pragma unroll
+                for (int b = 0; b < 4; ++b)
+                    if (row < M && gk + b < K) v |= (A[aoff + b] & 0xFF) << (8 * b);
+            }
+            regA[i] = v;
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < B1_BITER; ++i) {
+        const int p = tid + i * B1_THREADS;
+        if (p < B1_BCH) {
+            const int n = p / B1_KCH, k4 = p % B1_KCH;
+            const int gk = k0 + k4 * 4;
+            const int row = n0 + n;
+            const int woff = row * K + gk;
+            int v = 0;
+            if (row < N && gk + 3 < K) v = *(const int*)(W + woff);
+            else {
+                #pragma unroll
+                for (int b = 0; b < 4; ++b)
+                    if (row < N && gk + b < K) v |= (W[woff + b] & 0xFF) << (8 * b);
+            }
+            regB[i] = v;
+        }
+    }
+}
+
+__device__ __forceinline__ void b1_stage_store(
+    int8_t* sA, int8_t* sB, const int* regA, const int* regB, int tid)
+{
+    #pragma unroll
+    for (int i = 0; i < B1_AITER; ++i) {
+        const int p = tid + i * B1_THREADS;
+        if (p < B1_ACH) {
+            const int m = p / B1_KCH, k4 = p % B1_KCH;
+            const int kx = k4 ^ ((m / B1_MM) & 7);     // XOR swizzle (mask 7)
+            *(int*)(&sA[m * B1_SA + kx * 4]) = regA[i];
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < B1_BITER; ++i) {
+        const int p = tid + i * B1_THREADS;
+        if (p < B1_BCH) {
+            const int n = p / B1_KCH, k4 = p % B1_KCH;
+            const int kx = k4 ^ ((n / B1_MN) & 7);
+            *(int*)(&sB[n * B1_SB + kx * 4]) = regB[i];
+        }
+    }
+}
+
+__device__ __forceinline__ void b1_stage_compute(
+    const int8_t* sA, const int8_t* sB, int acc[B1_MM][B1_MN], int tm, int tn)
+{
+    #pragma unroll
+    for (int kk = 0; kk < B1_BK; kk += 4) {
+        const int k4 = kk / 4;
+        int aF[B1_MM], bF[B1_MN];
+        #pragma unroll
+        for (int mm = 0; mm < B1_MM; ++mm)
+            aF[mm] = *(const int*)(&sA[(tm * B1_MM + mm) * B1_SA + ((k4 ^ (tm & 7)) * 4)]);
+        #pragma unroll
+        for (int mn = 0; mn < B1_MN; ++mn)
+            bF[mn] = *(const int*)(&sB[(tn * B1_MN + mn) * B1_SB + ((k4 ^ (tn & 7)) * 4)]);
+        #pragma unroll
+        for (int mm = 0; mm < B1_MM; ++mm)
+            #pragma unroll
+            for (int mn = 0; mn < B1_MN; ++mn)
+                acc[mm][mn] = b1_dot4(aF[mm], bF[mn], acc[mm][mn]);
+    }
+}
+
+__global__ void __launch_bounds__(B1_THREADS)
+b1_gemm_kernel(const int8_t* __restrict__ A, const int8_t* __restrict__ W,
+               const float* __restrict__ x_scale, const float* __restrict__ w_scale,
+               const __half* __restrict__ bias, void* __restrict__ Out,
+               int M, int N, int K, int has_bias, int mode)
+{
+    __shared__ int8_t sA[2][B1_BM * B1_SA];
+    __shared__ int8_t sB[2][B1_BN * B1_SB];
+    const int tid = __builtin_amdgcn_workitem_id_x();
+    const int tm = tid / B1_TN;
+    const int tn = tid % B1_TN;
+
+    // block tile, GROUP_SIZE_M swizzle on the 1D grid
+    const int tiles_m = (M + B1_BM - 1) / B1_BM;
+    const int tiles_n = (N + B1_BN - 1) / B1_BN;
+    const int GSZ = tiles_m < 8 ? tiles_m : 8;
+    const int bid = __builtin_amdgcn_workgroup_id_x();
+    const int group = bid / (GSZ * tiles_n);
+    const int rem = bid % (GSZ * tiles_n);
+    const int mtile = group * GSZ + rem % GSZ;
+    const int ntile = rem / GSZ;
+    const int m0 = mtile * B1_BM;
+    const int n0 = ntile * B1_BN;
+
+    int acc[B1_MM][B1_MN];
+    #pragma unroll
+    for (int mm = 0; mm < B1_MM; ++mm)
+        #pragma unroll
+        for (int mn = 0; mn < B1_MN; ++mn) acc[mm][mn] = 0;
+
+    int regA[B1_AITER], regB[B1_BITER];
+
+    // prologue: stage 0 into buffer 0, prefetch stage 1
+    b1_stage_load(A, W, regA, regB, tid, m0, n0, M, N, K, 0);
+    b1_stage_store(sA[0], sB[0], regA, regB, tid);
+    if (K > B1_BK) b1_stage_load(A, W, regA, regB, tid, m0, n0, M, N, K, B1_BK);
+
+    for (int k0 = 0; k0 < K; k0 += B1_BK) {
+        __syncthreads();                            // B_i: everyone past compute(i-1)
+        const int buf = (k0 / B1_BK) & 1;
+        if (k0 + B1_BK < K) {
+            b1_stage_store(sA[buf ^ 1], sB[buf ^ 1], regA, regB, tid);
+            if (k0 + 2 * B1_BK < K) b1_stage_load(A, W, regA, regB, tid, m0, n0, M, N, K, k0 + 2 * B1_BK);
+        }
+        b1_stage_compute(sA[buf], sB[buf], acc, tm, tn);
+    }
+
+    // epilogue: mode 1 = fused dequant fp16 (bit-identical op order), else raw int32
+    if (mode == 1) {
+        #pragma unroll
+        for (int mm = 0; mm < B1_MM; ++mm) {
+            const int m = m0 + tm * B1_MM + mm;
+            if (m >= M) continue;
+            const float xsm = x_scale[m];
+            #pragma unroll
+            for (int mn = 0; mn < B1_MN; ++mn) {
+                const int n = n0 + tn * B1_MN + mn;
+                if (n >= N) continue;
+                float v = (float)acc[mm][mn] * (xsm * w_scale[n]);
+                if (has_bias) v += __half2float(bias[n]);
+                ((__half*)Out)[(size_t)m * N + n] = __float2half(v);
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int mm = 0; mm < B1_MM; ++mm) {
+            const int m = m0 + tm * B1_MM + mm;
+            if (m >= M) continue;
+            #pragma unroll
+            for (int mn = 0; mn < B1_MN; ++mn) {
+                const int n = n0 + tn * B1_MN + mn;
+                if (n >= N) continue;
+                ((int32_t*)Out)[(size_t)m * N + n] = acc[mm][mn];
+            }
+        }
+    }
+}
+
+extern "C" void b1_gemm_launch(const void* A, const void* W, const void* xs, const void* ws,
+                               const void* bias, void* O, int M, int N, int K, int has_bias, int mode) {
+    const int gx = ((M + B1_BM - 1) / B1_BM) * ((N + B1_BN - 1) / B1_BN);
+    b1_gemm_kernel<<<gx, B1_THREADS>>>((const int8_t*)A, (const int8_t*)W,
+        (const float*)xs, (const float*)ws, (const __half*)bias, O, M, N, K, has_bias, mode);
+}
+
 static hipblasHandle_t g_handle = nullptr;
 static void ensure_handle() {
     if (!g_handle) hipblasCreate(&g_handle);
@@ -150,6 +355,106 @@ extern "C" void dequant_launch(const void* acc, const void* x_scale, const void*
                                     (const float*)w_scale, (const __half*)bias,
                                     (__half*)out, M, N, has_bias);
 }
+
+// ---- fused ConvRot rotation (butterfly) + rowwise quantize, one launch ----
+// x fp16 [M,K] -> y int8 [M,K] (rotated & quantized), s fp32 [M] (scale).
+// The rotation H_{K/g} is the regular Hadamard (Theorem 3.3, convrot.py):
+// H_{4^k} = kron(H4, ...) normalized by 4^{k/2}; entries are +/-1/16 for
+// group_size 256. Because it is a Kronecker power of H4, x@H factors into
+// log4(256)=4 butterfly stages over base-4 digits (each a strided 4-point
+// transform with the same H4 coefficients) — 16x less math than the dense
+// bmm, computed in fp32 (torch's path does the dense bmm in fp16; ULP-level
+// differences are expected and self-consistent, see Track B plan B0).
+// Block = 256 threads, one row per block; rows are chunked in groups of 256
+// with an LDS double buffer; scale is a per-row max over all groups; a second
+// pass re-rotates from global x and quantizes (x is read twice, negligible).
+// regular Hadamard 4x4 (Theorem 3.3), symmetric: entries are +1 except
+// (i,k) in {(0,3),(1,2),(2,1),(3,0)} which are -1. Pure ALU, no memory.
+__device__ __forceinline__ float h4_coef(int i, int k) {
+    const int n = ((i == 0 && k == 3) || (i == 1 && k == 2) ||
+                   (i == 2 && k == 1) || (i == 3 && k == 0));
+    return n ? -1.f : 1.f;
+}
+
+__global__ void rotate_quantize_kernel(const __half* __restrict__ x,
+                                       int8_t* __restrict__ y,
+                                       float* __restrict__ s,
+                                       int M, int K) {
+    const int row = __builtin_amdgcn_workgroup_id_x();
+    const int tid = __builtin_amdgcn_workitem_id_x();          // 0..255
+    const int ngrp = K >> 8;                                    // K/256
+    const __half* xr = x + (size_t)row * K;
+    int8_t* yr = y + (size_t)row * K;
+    __shared__ float b1[256], b2[256];
+    const float inv16 = 1.f / 16.f;
+
+    float rowmax = 0.f;
+    for (int g = 0; g < ngrp; ++g) {
+        const int base = g << 8;
+        float* a = b1;
+        float* bb = b2;
+        a[tid] = __half2float(xr[base + tid]);
+        for (int t = 0; t < 4; ++t) {                           // digits 0..3 (any order)
+            __syncthreads();
+            const int st = 1 << (2 * t);                        // stride 1,4,16,64
+            const int qb = tid - ((tid / st) & 3) * st;   // clear ONLY digit t (keep low digits)
+            const int col = (tid / st) & 3;                     // this element's digit-t
+            float acc = 0.f;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                acc += h4_coef(i, col) * a[qb + i * st];
+            bb[tid] = acc;
+            float* tmp = a; a = bb; bb = tmp;
+        }
+        __syncthreads();
+        rowmax = fmaxf(rowmax, fabsf(a[tid] * inv16));
+    }
+    // per-row scale (8 warps)
+    __shared__ float sm[8];
+    const int warp = tid >> 5, lane = tid & 31;
+    float m = rowmax;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_down(m, o));
+    if (lane == 0) sm[warp] = m;
+    __syncthreads();
+    if (warp == 0) {
+        m = (lane < 8) ? sm[lane] : 0.f;
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) m = fmaxf(m, __shfl_down(m, o));
+        if (lane == 0) sm[0] = fmaxf(m / 127.0f, 1e-30f);
+    }
+    __syncthreads();
+    const float scale = sm[0];
+    if (tid == 0) s[row] = scale;
+    // quantize pass: re-rotate from global x, then q = floor(v/scale + 0.5)
+    for (int g = 0; g < ngrp; ++g) {
+        const int base = g << 8;
+        float* a = b1;
+        float* bb = b2;
+        a[tid] = __half2float(xr[base + tid]);
+        for (int t = 0; t < 4; ++t) {
+            __syncthreads();
+            const int st = 1 << (2 * t);
+            const int qb = tid - ((tid / st) & 3) * st;
+            const int col = (tid / st) & 3;
+            float acc = 0.f;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                acc += h4_coef(i, col) * a[qb + i * st];
+            bb[tid] = acc;
+            float* tmp = a; a = bb; bb = tmp;
+        }
+        __syncthreads();
+        const float v = a[tid] * inv16 / scale;
+        float q = floorf(v + 0.5f);
+        q = fminf(fmaxf(q, -128.0f), 127.0f);
+        yr[base + tid] = (int8_t)q;
+    }
+}
+
+extern "C" void rotate_quantize_launch(const void* x, void* y, void* s, int M, int K) {
+    rotate_quantize_kernel<<<M, 256>>>((const __half*)x, (int8_t*)y, (float*)s, M, K);
+}
 """
 
 _CPP_SRC = r"""
@@ -160,6 +465,9 @@ extern "C" int int8_gemm_nt(int m, int n, int k, const int8_t* A, const int8_t* 
 extern "C" void quantize_rowwise_launch(const void* x, void* y, void* s, int M, int K);
 extern "C" void dequant_launch(const void* acc, const void* x_scale, const void* w_scale,
                                const void* bias, void* out, int M, int N, int has_bias);
+extern "C" void rotate_quantize_launch(const void* x, void* y, void* s, int M, int K);
+extern "C" void b1_gemm_launch(const void* A, const void* W, const void* xs, const void* ws,
+                               const void* bias, void* O, int M, int N, int K, int has_bias, int mode);
 
 torch::Tensor int8_gemm_t(torch::Tensor a, torch::Tensor b) {
     TORCH_CHECK(a.is_cuda() && b.is_cuda(), "cuda tensors required");
@@ -198,6 +506,38 @@ void dequant_t(torch::Tensor acc, torch::Tensor x_scale, torch::Tensor w_scale,
                    has_bias ? bias.data_ptr() : nullptr, out.data_ptr(),
                    acc.size(0), acc.size(1), has_bias);
 }
+
+// x fp16 [M,K] -> y int8 [M,K] (ConvRot-rotated + rowwise quantized), s fp32 [M]
+void rotate_quantize_t(torch::Tensor x, torch::Tensor y, torch::Tensor s) {
+    rotate_quantize_launch(x.data_ptr(), y.data_ptr(), s.data_ptr(), x.size(0), x.size(1));
+}
+
+// ---- B1: hand-written DP4a GEMM (raw int32 out, verification gate) ----
+torch::Tensor b1_gemm_raw_t(torch::Tensor a, torch::Tensor w) {
+    TORCH_CHECK(a.is_cuda() && w.is_cuda(), "cuda tensors required");
+    TORCH_CHECK(a.dtype() == torch::kInt8 && w.dtype() == torch::kInt8, "int8 required");
+    int m = a.size(0), k = a.size(1), n = w.size(0);
+    TORCH_CHECK(w.size(1) == k, "inner dim mismatch");
+    TORCH_CHECK(k % 4 == 0, "k must be a multiple of 4 (DP4a)");
+    auto c = torch::empty({m, n}, a.options().dtype(torch::kInt32));
+    b1_gemm_launch(a.data_ptr(), w.data_ptr(), nullptr, nullptr, nullptr,
+                   c.data_ptr(), m, n, k, 0, 0);
+    return c;
+}
+
+// ---- B1: fused DP4a GEMM + dequant epilogue (2-launch path) ----
+// xi [M,K] int8, w [N,K] int8, xs [M] fp32, ws [N] fp32, bias [N] fp16 (or empty),
+// out [M,N] fp16. Bit-identical to int8_gemm_nt_t + dequant_t.
+void b1_gemm_dequant_t(torch::Tensor xi, torch::Tensor w, torch::Tensor xs, torch::Tensor ws,
+                       torch::Tensor bias, torch::Tensor out) {
+    TORCH_CHECK(xi.is_cuda() && w.is_cuda(), "cuda tensors required");
+    int m = xi.size(0), k = xi.size(1), n = w.size(0);
+    TORCH_CHECK(w.size(1) == k, "inner dim mismatch");
+    TORCH_CHECK(k % 4 == 0, "k must be a multiple of 4 (DP4a)");
+    int has_bias = bias.numel() > 0 ? 1 : 0;
+    b1_gemm_launch(xi.data_ptr(), w.data_ptr(), xs.data_ptr(), ws.data_ptr(),
+                   has_bias ? bias.data_ptr() : nullptr, out.data_ptr(), m, n, k, has_bias, 1);
+}
 """
 
 _ext = None
@@ -214,6 +554,25 @@ _ext = None
 # OP_T remains the default; OP_N stays available via ROCM_INT8_OPN=1 for
 # experiments (microbench-proven faster per-shape, so revisit post-fusion).
 _USE_OPN = os.environ.get("ROCM_INT8_OPN", "0").strip().lower() in ("1", "true", "on", "yes")
+
+# --- B1: hand-written DP4a GEMM + fused dequant epilogue ---
+# ROCM_INT8_B1=1 replaces the rocBLAS GEMM + dequant launch with the fused B1
+# kernel (2 launches per linear instead of 3; int32 [M,N] round-trip removed).
+# Bit-identical to the 3-launch path by construction (verified per-shape with
+# torch.equal). bf16/fp32 compute falls back to the 3-launch path (the B1
+# epilogue writes fp16 bits only). Default OFF — A/B via env, matching the
+# bench_launch.py 'b1' variant.
+_USE_B1 = os.environ.get("ROCM_INT8_B1", "0").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _b1_fused(ext, xi, w, ws, xs, bias, compute_dtype, m, n):
+    """Fused DP4a GEMM + dequant for fp16 output; None triggers 3-launch fallback."""
+    if compute_dtype != torch.float16:
+        return None
+    out = torch.empty((m, n), device=xi.device, dtype=torch.float16)
+    ext.b1_gemm_dequant_t(xi, w, xs, ws,
+                          bias if bias is not None else torch.empty(0, device=xi.device), out)
+    return out
 
 
 def _pre_transposed(weight: torch.Tensor):
@@ -246,11 +605,12 @@ def _load_ext():
         if _ext is not None:
             return _ext
         _ext = cpp_ext.load_inline(
-            name="rocblas_int8_gemm", cpp_sources=_CPP_SRC, cuda_sources=_CUDA_SRC,
-            functions=["int8_gemm_t", "int8_gemm_nt_t", "quantize_rowwise_t", "dequant_t"], verbose=False,
-            extra_cuda_cflags=["-nogpulib", f"-I{DEVEL}\\include"],
-            extra_ldflags=[f"{DEVEL}\\lib\\hipblas.lib"],
-        )
+                    name="rocblas_int8_gemm", cpp_sources=_CPP_SRC, cuda_sources=_CUDA_SRC,
+                    functions=["int8_gemm_t", "int8_gemm_nt_t", "quantize_rowwise_t", "dequant_t",
+                               "rotate_quantize_t", "b1_gemm_raw_t", "b1_gemm_dequant_t"], verbose=False,
+                    extra_cuda_cflags=["-nogpulib", f"-I{DEVEL}\\include"],
+                    extra_ldflags=[f"{DEVEL}\\lib\\hipblas.lib"],
+                )
     return _ext
 
 
@@ -275,6 +635,27 @@ def quantize_rowwise_torch(x: torch.Tensor):
     return q, scale.to(torch.float32)
 
 
+_GROUP_SIZE = 256  # convrot group size (matches the pack's CONVROT_GROUP_SIZE)
+
+
+def rotate_quantize(x: torch.Tensor):
+    """Fused ConvRot rotation (butterfly) + rowwise quantize, one HIP launch.
+
+    x fp16 [M,K] (K % 256 == 0) -> (int8 [M,K] rotated+quantized, scale fp32 [M,1]).
+    Numerics: rotation computed in fp32 via the Kronecker butterfly (torch's
+    path does a dense fp16 bmm — ULP-level differences expected, self-consistent).
+    Falls back to quantize_rowwise (no rotation) for unsupported inputs.
+    """
+    if x.dtype != torch.float16 or x.shape[-1] % _GROUP_SIZE != 0:
+        return quantize_rowwise(x)
+    ext = _load_ext()
+    M, K = x.shape
+    y = torch.empty((M, K), device=x.device, dtype=torch.int8)
+    s = torch.empty((M, 1), device=x.device, dtype=torch.float32)
+    ext.rotate_quantize_t(x.contiguous(), y, s)
+    return y, s
+
+
 def _dequant(acc, x_scale, w_scale, bias, compute_dtype):
     M, N = acc.shape
     if compute_dtype != torch.float16:
@@ -296,16 +677,21 @@ def int8_linear(x, weight, weight_scale, bias=None, compute_dtype=torch.float16)
     x_2d = x.reshape(-1, x_shape_orig[-1])
     N = weight.shape[0]
     x_int8, x_scale = quantize_rowwise(x_2d)
-    if _USE_OPN:
-        acc = _load_ext().int8_gemm_t(x_int8, _pre_transposed(weight))  # [M, N] int32, exact
-    else:
-        acc = _load_ext().int8_gemm_nt_t(x_int8, weight)  # [M, N] int32, exact
     if not isinstance(weight_scale, torch.Tensor):
         weight_scale = torch.tensor([weight_scale], device=x.device, dtype=torch.float32)
     ws = weight_scale.to(x.device).to(torch.float32).reshape(-1)  # [N] or [1]
     if ws.numel() == 1 and N > 1:
         # dequant kernel indexes w_scale[c] for c in [0,N) -- materialize the broadcast
         ws = ws.expand(N).contiguous()
+    if _USE_B1:
+        out = _b1_fused(_load_ext(), x_int8, weight, ws, x_scale.reshape(-1).contiguous(),
+                        bias, compute_dtype, x_2d.shape[0], N)
+        if out is not None:
+            return out.reshape(x_shape_orig[:-1] + (N,))
+    if _USE_OPN:
+        acc = _load_ext().int8_gemm_t(x_int8, _pre_transposed(weight))  # [M, N] int32, exact
+    else:
+        acc = _load_ext().int8_gemm_nt_t(x_int8, weight)  # [M, N] int32, exact
     out = _dequant(acc, x_scale, ws, bias, compute_dtype)
     return out.reshape(x_shape_orig[:-1] + (N,))
 
@@ -316,11 +702,16 @@ def int8_linear_per_row(x, weight, weight_scale, bias=None, compute_dtype=torch.
     x_2d = x.reshape(-1, x_shape_orig[-1])
     N = weight.shape[0]
     x_int8, x_scale = quantize_rowwise(x_2d)
+    ws = weight_scale.to(x.device).to(torch.float32).reshape(-1)  # [N]
+    if _USE_B1:
+        out = _b1_fused(_load_ext(), x_int8, weight, ws, x_scale.reshape(-1).contiguous(),
+                        bias, compute_dtype, x_2d.shape[0], N)
+        if out is not None:
+            return out.reshape(x_shape_orig[:-1] + (N,))
     if _USE_OPN:
         acc = _load_ext().int8_gemm_t(x_int8, _pre_transposed(weight))  # [M, N] int32, exact
     else:
         acc = _load_ext().int8_gemm_nt_t(x_int8, weight)  # [M, N] int32, exact
-    ws = weight_scale.to(x.device).to(torch.float32).reshape(-1)  # [N]
     out = _dequant(acc, x_scale, ws, bias, compute_dtype)
     return out.reshape(x_shape_orig[:-1] + (N,))
 
