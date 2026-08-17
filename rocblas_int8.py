@@ -562,7 +562,7 @@ _USE_OPN = os.environ.get("ROCM_INT8_OPN", "0").strip().lower() in ("1", "true",
 # torch.equal). bf16/fp32 compute falls back to the 3-launch path (the B1
 # epilogue writes fp16 bits only). Default OFF — A/B via env, matching the
 # bench_launch.py 'b1' variant.
-_USE_B1 = os.environ.get("ROCM_INT8_B1", "0").strip().lower() in ("1", "true", "on", "yes")
+_USE_B1 = os.environ.get("ROCM_INT8_B1", "1").strip().lower() in ("1", "true", "on", "yes")
 
 
 def _b1_fused(ext, xi, w, ws, xs, bias, compute_dtype, m, n):

@@ -6,6 +6,10 @@ that swaps the pack's Triton INT8 GEMMs for a **rocBLAS-backed native INT8
 integration, ConvRot rotation, LoRA baking, per-row/per-channel quant — is
 unchanged and comes from the original pack. Very WIP, expect jank. All courtesy of Deepseek-V4-Flash-0731.
 
+> **All changes live on the `rocblas-backend` branch.**
+> The `main` branch stays as originally forked from patientx.
+> Install by cloning the `rocblas-backend` branch.
+
 (Set `ROCM_INT8_ROCBLAS=0` to revert to the original Triton
 kernels at runtime.)
 
@@ -52,18 +56,17 @@ expect it to work on the others but verify before relying on it.
   after the first build.
 - Only tested on Windows + ROCm 7.14 (ComfyUI 0.33), RX 6600.
 
-## Fused DP4a kernel (B1, optional)
+## Fused DP4a kernel (B1, on by default)
 
-An optional hand-written DP4a GEMM with the dequant epilogue fused in-kernel,
+A hand-written DP4a GEMM with the dequant epilogue fused in-kernel,
 achieving ~45% of DP4a peak (vs rocBLAS ~35–38%) while remaining
 **byte-identical** to the 3-launch path (same seed, same PNG).
 
-Enable: `ROCM_INT8_B1=1` before launching. Default OFF — no change to shipped
-behaviour without this flag.
+On by default. Disable with `ROCM_INT8_B1=0` to revert to the 3-launch path.
 
 | | 3-launch | B1 fused |
 |---|---|---|
-| s/it (Anima 1024², fp16) | 5.51 | **5.31** |
+| s/it (Anima 1024², fp16) | 5.41–5.53 | **5.20–5.33** (~3.8% faster) |
 | PNG | `5573d639…` | `5573d639…` (byte-identical) |
 | launches per linear | 3 | 2 (quantize + fused GEMM+dequant) |
 
