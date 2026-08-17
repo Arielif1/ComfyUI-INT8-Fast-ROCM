@@ -67,8 +67,17 @@ On by default. Disable with `ROCM_INT8_FUSED_GEMM_DEQUANT=0` to revert to the 3-
 | | 3-launch | B1 fused |
 |---|---|---|
 | s/it (Anima 1024², fp16) | 5.41–5.53 | **5.20–5.33** (~3.8% faster) |
-| PNG | `5573d639…` | `5573d639…` (byte-identical) |
+| PNG | `5573d639…` ⚠️BROKEN (wrong-VAE era, see note) | `5573d639…` ⚠️BROKEN (wrong-VAE era, see note) |
 | launches per linear | 3 | 2 (quantize + fused GEMM+dequant) |
+
+> ⚠️ **HASH NOTE (2026-08-17 evening):** the PNG hashes above were captured with
+> the wrong VAE (`diffusion_pytorch_model.safetensors` — a non-Anima 16-ch
+> AutoencodingEngine that silently garbled every output with a tiled mosaic;
+> 16=16 latent channels so decode never errored). They prove determinism only,
+> NOT correctness. The correct Anima VAE is `qwen_image_vae.safetensors`
+> (comfy loads it as `comfy.ldm.wan.vae.WanVAE`). Speed numbers are unaffected
+> (KSampler s/it excludes VAE decode). If you run this workflow: use the Qwen
+> VAE, and re-baseline PNG acceptance against its outputs.
 
 DP4a true peak on RX 6600 = 17.85 T-MAC/s (1792 × 4 MAC/cyc × 2.49 GHz);
 int8 is exactly 2× fp16 on this hardware (32-bit datapath: 4×8b vs 2×16b).
