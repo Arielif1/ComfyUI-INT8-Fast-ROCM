@@ -41,7 +41,7 @@ _CUDA_SRC = r"""
 
 // =================== B1: hand-written DP4a GEMM + fused dequant ==================
 // 2026-08-17. Replaces the rocBLAS int8 GEMM + separate dequant launch when
-// ROCM_INT8_B1=1 (2 launches per linear instead of 3). Bit-identical to the
+// ROCM_INT8_FUSED_GEMM_DEQUANT=1 (2 launches per linear instead of 3). Bit-identical to the
 // 3-launch path: int32 accumulation is exact integer math and the epilogue
 // matches dequant_kernel's op order exactly:
 //   v = (float)acc * (x_scale[m] * w_scale[n]); if bias: v += half2float(bias[n])
@@ -556,13 +556,13 @@ _ext = None
 _USE_OPN = os.environ.get("ROCM_INT8_OPN", "0").strip().lower() in ("1", "true", "on", "yes")
 
 # --- B1: hand-written DP4a GEMM + fused dequant epilogue ---
-# ROCM_INT8_B1=1 replaces the rocBLAS GEMM + dequant launch with the fused B1
+# ROCM_INT8_FUSED_GEMM_DEQUANT=1 replaces the rocBLAS GEMM + dequant launch with the fused B1
 # kernel (2 launches per linear instead of 3; int32 [M,N] round-trip removed).
 # Bit-identical to the 3-launch path by construction (verified per-shape with
 # torch.equal). bf16/fp32 compute falls back to the 3-launch path (the B1
 # epilogue writes fp16 bits only). Default OFF — A/B via env, matching the
 # bench_launch.py 'b1' variant.
-_USE_B1 = os.environ.get("ROCM_INT8_B1", "1").strip().lower() in ("1", "true", "on", "yes")
+_USE_B1 = os.environ.get("ROCM_INT8_FUSED_GEMM_DEQUANT", "1").strip().lower() in ("1", "true", "on", "yes")
 
 
 def _b1_fused(ext, xi, w, ws, xs, bias, compute_dtype, m, n):

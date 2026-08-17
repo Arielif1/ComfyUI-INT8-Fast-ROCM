@@ -62,7 +62,7 @@ A hand-written DP4a GEMM with the dequant epilogue fused in-kernel,
 achieving ~45% of DP4a peak (vs rocBLAS ~35–38%) while remaining
 **byte-identical** to the 3-launch path (same seed, same PNG).
 
-On by default. Disable with `ROCM_INT8_B1=0` to revert to the 3-launch path.
+On by default. Disable with `ROCM_INT8_FUSED_GEMM_DEQUANT=0` to revert to the 3-launch path.
 
 | | 3-launch | B1 fused |
 |---|---|---|
