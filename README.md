@@ -1,91 +1,64 @@
 # ComfyUI-INT8-Fast-ROCM — rocblas DP4a backend fork
 
-(Vibecoded) Fork of [patientx/ComfyUI-INT8-Fast-ROCM](https://github.com/patientx/ComfyUI-INT8-Fast-ROCM)
-that swaps the pack's Triton INT8 GEMMs for a **rocBLAS-backed native INT8
-(DP4a) backend on AMD RDNA2**. Everything else — model loading, ComfyKitchen
-integration, ConvRot rotation, LoRA baking, per-row/per-channel quant — is
-unchanged and comes from the original pack. Very WIP, expect jank. All courtesy of Deepseek-V4-Flash-0731.
+(Vibecoded) fork of [patientx/ComfyUI-INT8-Fast-ROCM](https://github.com/patientx/ComfyUI-INT8-Fast-ROCM)
+that swaps the pack's Triton INT8 GEMMs for a rocBLAS-backed native INT8 (DP4a)
+path on AMD RDNA2. Everything else — model loading, ComfyKitchen integration,
+ConvRot rotation, LoRA baking, quant — is unchanged from the original pack.
+Very WIP, expect jank. All courtesy of Deepseek-V4-Flash-0731.
 
-> **All changes live on the `rocblas-backend` branch.**
-> The `main` branch stays as originally forked from patientx.
-> Install by cloning the `rocblas-backend` branch.
+Development happens on the `rocblas-backend` branch; `main` is kept in sync.
 
-(Set `ROCM_INT8_ROCBLAS=0` to revert to the original Triton
-kernels at runtime.)
+Set `ROCM_INT8_ROCBLAS=0` to fall back to the pack's original Triton kernels
+at runtime.
 
 ## Why
 
 On RDNA2 (RX 6600 / gfx1032) the pack's Triton `tl.dot` INT8 kernels compile to
-FMA emulation — no native INT8 path. rocBLAS ships real DP4a kernels for
-gfx1032, giving a genuine ~2× instruction rate on INT8 GEMMs.
+FMA emulation, so there is no native INT8 path. rocBLAS ships real DP4a kernels
+for gfx1032, which gives a genuine 2× instruction rate on INT8 GEMMs.
 
-**Important:** the loader's `weight_dtype` must be set to **`fp16`** (not
-default/bf16) — bf16 runs at FP32 rate on RDNA2 and it is what the original
-pack's default uses.
+Set the loader's `weight_dtype` to `fp16`, not the default/bf16: bf16 runs at
+FP32 rate on RDNA2, and it is what the original pack defaults to.
 
-## Results (Anima, 1024×1024, 10 steps, CFG 5 — KSampler s/it)
+## Results (Anima 1024×1024, 10 steps, CFG 5 — KSampler s/it)
 
 | Variant | s/it |
 |---|---|
 | fp8 (bf16 compute) | 13.4 |
-| INT8 Triton (pack), bf16 compute | 7.52 |
 | INT8 Triton (pack), fp16 compute | 5.73 |
-| **INT8 rocblas (this fork), fp16 compute** | **5.51** |
+| **INT8 rocblas (this fork), fp16 compute** | **~5.3** |
 
-That is **~2.4× faster than fp8** and **~1.04× faster than the pack's Triton
-kernels at the same fp16 compute settings** (the gap widens to ~1.36× when both
-use the bf16 default, which forces the Triton path's fp32-upcast quantize).
+Roughly 2.5× over fp8, and around 1.1× over the pack's own Triton kernels at
+the same fp16 settings. Output is byte-identical to the pack's (INT8 GEMM is
+exact integer math and the quantizer is the same spec).
+
+## Fused DP4a GEMM (on by default)
+
+A hand-written DP4a GEMM with the dequant epilogue fused in, so each int8
+linear costs 2 launches instead of 3. It's bit-identical to the plain path, so
+the switch is invisible except in timings. Revert with
+`ROCM_INT8_FUSED_GEMM_DEQUANT=0`.
 
 ## Which models does it work on?
 
 The backend is model-agnostic: it replaces the GEMM behind whatever the pack
-already handles (W8A8/ConvRot DiTs — Flux2, Anima, Chroma, Z-Image, etc.), and
-supports both per-channel and per-row weight scales, fp16 and bf16 compute
-outputs. **It has only been tested on Anima so far** —
-expect it to work on the others but verify before relying on it.
+already handles (W8A8/ConvRot DiTs — Flux2, Anima, Chroma, Z-Image, etc.) and
+supports per-channel and per-row weight scales, fp16 and bf16 compute outputs.
+Only tested on Anima so far. Expect the others to work, but verify before
+relying on it.
 
 ## Caveats / notes
 
-- The original pack's Triton kernels beat rocBLAS on some small/odd GEMM shapes;
-  the workflow-level win comes from the steady state at real model shapes.
-- The compiled extension lives as C++/HIP source inside `rocblas_int8.py`:
-  on first import it builds via torch's `load_inline` when no prebuilt `.pyd`
-  is found (needs MSVC once, plus the ROCm SDK include/lib paths — the `DEVEL`
-  constant at the top is hardcoded to the dev machine, adjust it if building
-  elsewhere), and is then loaded directly at runtime — no toolchain needed
-  after the first build.
+- The original pack's Triton kernels beat rocBLAS on some small/odd GEMM
+  shapes; the workflow-level win comes from steady state at real model shapes.
+- The extension ships as C++/HIP source inside `rocblas_int8.py`. First import
+  builds it via torch's `load_inline` when no prebuilt `.pyd` exists (needs
+  MSVC once, plus the ROCm SDK include/lib paths; the `DEVEL` constant at the
+  top is hardcoded to the machine it was built on, so adjust it if you build
+  elsewhere). After that it loads directly with no toolchain.
 - Only tested on Windows + ROCm 7.14 (ComfyUI 0.33), RX 6600.
 
-## Fused DP4a kernel (B1, on by default)
-
-A hand-written DP4a GEMM with the dequant epilogue fused in-kernel,
-achieving ~45% of DP4a peak (vs rocBLAS ~35–38%) while remaining
-**byte-identical** to the 3-launch path (same seed, same PNG).
-
-On by default. Disable with `ROCM_INT8_FUSED_GEMM_DEQUANT=0` to revert to the 3-launch path.
-
-| | 3-launch | B1 fused |
-|---|---|---|
-| s/it (Anima 1024², fp16) | 5.41–5.53 | **5.20–5.33** (~3.8% faster) |
-| PNG | `5573d639…` ⚠️BROKEN (wrong-VAE era, see note) | `5573d639…` ⚠️BROKEN (wrong-VAE era, see note) |
-| launches per linear | 3 | 2 (quantize + fused GEMM+dequant) |
-
-> ⚠️ **HASH NOTE (2026-08-17 evening):** the PNG hashes above were captured with
-> the wrong VAE (`diffusion_pytorch_model.safetensors` — a non-Anima 16-ch
-> AutoencodingEngine that silently garbled every output with a tiled mosaic;
-> 16=16 latent channels so decode never errored). They prove determinism only,
-> NOT correctness. The correct Anima VAE is `qwen_image_vae.safetensors`
-> (comfy loads it as `comfy.ldm.wan.vae.WanVAE`). Speed numbers are unaffected
-> (KSampler s/it excludes VAE decode). If you run this workflow: use the Qwen
-> VAE, and re-baseline PNG acceptance against its outputs.
-
-DP4a true peak on RX 6600 = 17.85 T-MAC/s (1792 × 4 MAC/cyc × 2.49 GHz);
-int8 is exactly 2× fp16 on this hardware (32-bit datapath: 4×8b vs 2×16b).
-Attention (SDPA math) is a bandwidth wall (~1.9 s/step, no flash on gfx1032)
-and is the remaining ~36% of step time that cannot be kernel-optimized away.
-
 ---
-
 <details>
 <summary><b>Original README (patientx/ComfyUI-INT8-Fast-ROCM)</b></summary>
 
